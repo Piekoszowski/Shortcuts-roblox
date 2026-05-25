@@ -1,5 +1,6 @@
-# Provides developer shortcuts to modules, services, tags, custom paths automatic caching no re-require cost, a lot of that is making easier remotes & networking management and more intuitive data handling and is deeply integrated with https://github.com/MadStudioRoblox/Replica (and ProfileService). Supports basic output visibility management.
-# Reducing Data and Structure Boilerplate https://www.roblox.com/games/81317406665582/Shortcuts-Reducing-Data-and-Structure-Boilerplate
+## Provides developer shortcuts to modules, services, tags, custom paths automatic caching no re-require cost, a lot of that is making easier remotes & networking management and more intuitive data handling and is deeply integrated with https://github.com/MadStudioRoblox/Replica (and ProfileService). Supports basic output visibility management.
+
+## Reducing Data and Structure Boilerplate https://www.roblox.com/games/81317406665582/Shortcuts-Reducing-Data-and-Structure-Boilerplate
 
 This repo contains aditional folders (Services, PlayerAdded's, CharacterAdded's, Data, Main's) that are filled with small code snippets that showcase the API of the shortcuts tool in a practical scenario. The place is uncopylocked and feel free to grab the tool from there.
 
