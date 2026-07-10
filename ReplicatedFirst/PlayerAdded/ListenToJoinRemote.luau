@@ -39,7 +39,7 @@ function Module.Init(_player: Player): ()
 		tempEvent:CallBack(function()
 			print("temp remote callback ran")
 		end)
-		tempEvent:Disconnect()
+		tempEvent:DisconnectAll()
 		print("temp remote listener is off")
 	end
 end

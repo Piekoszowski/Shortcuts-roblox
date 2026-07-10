@@ -37,6 +37,8 @@ export type NavigationResult = {
 
 --[[ Helpers ]]--
 local Helpers = {}
+Helpers.REMOTE_SETUP_TIMEOUT_SECONDS = 30
+Helpers.REMOTE_EVENT_ENDPOINT_NAME = "Event"
 local RuntimeRequire: (ModuleScript) -> any = require
 
 local function ErrorRequire(originalKey: string, moduleScript: ModuleScript?, requireError: any): string
@@ -389,6 +391,235 @@ function Helpers.createUnreliableRemoteFunction(Name: string, RemotesFolder: Ins
 	Helpers.createUnreliableRemoteEvent("Sent", Folder)
 	Helpers.createUnreliableRemoteEvent("Receive", Folder)
 	return Folder
+end
+
+function Helpers.getRemoteEventEndpoint(child: Instance?, unreliable: boolean): RemoteEvent?
+	if not child then
+		return nil
+	end
+
+	if unreliable then
+		if child:IsA("UnreliableRemoteEvent") then
+			return child :: any
+		end
+		if child:IsA("Folder") then
+			local eventChild = child:FindFirstChild(Helpers.REMOTE_EVENT_ENDPOINT_NAME)
+			if eventChild and eventChild:IsA("UnreliableRemoteEvent") then
+				return eventChild :: any
+			end
+		end
+		return nil
+	end
+
+	if child:IsA("RemoteEvent") then
+		return child
+	end
+
+	if child:IsA("Folder") then
+		local eventChild = child:FindFirstChild(Helpers.REMOTE_EVENT_ENDPOINT_NAME)
+		if eventChild and eventChild:IsA("RemoteEvent") then
+			return eventChild
+		end
+	end
+
+	return nil
+end
+
+function Helpers.promoteRemoteEventToSharedFolder(name: string, remotesFolder: Instance, remoteEvent: Instance): Folder
+	remoteEvent.Parent = nil
+	local folder = Instance.new("Folder")
+	folder.Name = name
+	folder.Parent = remotesFolder
+	remoteEvent.Name = Helpers.REMOTE_EVENT_ENDPOINT_NAME
+	remoteEvent.Parent = folder
+	return folder
+end
+
+function Helpers.addRemoteFunctionEndpointsToFolder(folder: Folder, unreliable: boolean)
+	if unreliable then
+		if not folder:FindFirstChild("Sent") then
+			Helpers.createUnreliableRemoteEvent("Sent", folder)
+		end
+		if not folder:FindFirstChild("Receive") then
+			Helpers.createUnreliableRemoteEvent("Receive", folder)
+		end
+		return
+	end
+
+	if not folder:FindFirstChild("Sent") then
+		Helpers.createRemoteEvent("Sent", folder)
+	end
+	if not folder:FindFirstChild("Receive") then
+		Helpers.createRemoteEvent("Receive", folder)
+	end
+end
+
+function Helpers.isRemoteFunctionFolder(instance: Instance?, unreliable: boolean): boolean
+	if not instance or not instance:IsA("Folder") then
+		return false
+	end
+
+	local sent = instance:FindFirstChild("Sent")
+	local receive = instance:FindFirstChild("Receive")
+	if not sent or not receive then
+		return false
+	end
+
+	if unreliable then
+		return (sent:IsA("UnreliableRemoteEvent") or sent:IsA("RemoteEvent"))
+			and (receive:IsA("UnreliableRemoteEvent") or receive:IsA("RemoteEvent"))
+	end
+
+	return sent:IsA("RemoteEvent") and receive:IsA("RemoteEvent")
+end
+
+function Helpers.ensureRemoteEventInstance(name: string, remotesFolder: Instance, unreliable: boolean): Instance
+	local existing = remotesFolder:FindFirstChild(name)
+	local endpoint = Helpers.getRemoteEventEndpoint(existing, unreliable)
+	if endpoint then
+		return endpoint
+	end
+
+	if existing and existing:IsA("Folder") then
+		Helpers.addRemoteFunctionEndpointsToFolder(existing, unreliable)
+		local eventChild = existing:FindFirstChild(Helpers.REMOTE_EVENT_ENDPOINT_NAME)
+		if eventChild then
+			if unreliable and eventChild:IsA("UnreliableRemoteEvent") then
+				return eventChild
+			end
+			if not unreliable and eventChild:IsA("RemoteEvent") then
+				return eventChild
+			end
+		end
+
+		if unreliable then
+			return Helpers.createUnreliableRemoteEvent(Helpers.REMOTE_EVENT_ENDPOINT_NAME, existing)
+		end
+		return Helpers.createRemoteEvent(Helpers.REMOTE_EVENT_ENDPOINT_NAME, existing)
+	end
+
+	if existing then
+		warn(
+			string.format(
+				"[Shortcuts] Replacing invalid remote '%s' (%s) under %s for RemoteEvent.",
+				name,
+				existing.ClassName,
+				remotesFolder:GetFullName()
+			)
+		)
+		existing:Destroy()
+	end
+
+	if unreliable then
+		return Helpers.createUnreliableRemoteEvent(name, remotesFolder)
+	end
+	return Helpers.createRemoteEvent(name, remotesFolder)
+end
+
+function Helpers.ensureRemoteFunctionFolder(name: string, remotesFolder: Instance, unreliable: boolean): Folder
+	local existing = remotesFolder:FindFirstChild(name)
+	if Helpers.isRemoteFunctionFolder(existing, unreliable) then
+		return existing :: Folder
+	end
+
+	local flatEventClass = if unreliable then "UnreliableRemoteEvent" else "RemoteEvent"
+	if existing and existing:IsA(flatEventClass) then
+		local folder = Helpers.promoteRemoteEventToSharedFolder(name, remotesFolder, existing)
+		Helpers.addRemoteFunctionEndpointsToFolder(folder, unreliable)
+		return folder
+	end
+
+	if existing and existing:IsA("Folder") then
+		Helpers.addRemoteFunctionEndpointsToFolder(existing, unreliable)
+		if Helpers.isRemoteFunctionFolder(existing, unreliable) then
+			return existing
+		end
+	end
+
+	if existing then
+		warn(
+			string.format(
+				"[Shortcuts] Replacing invalid remote '%s' (%s) under %s with a RemoteFunction folder (Sent/Receive).",
+				name,
+				existing.ClassName,
+				remotesFolder:GetFullName()
+			)
+		)
+		existing:Destroy()
+	end
+
+	if unreliable then
+		return Helpers.createUnreliableRemoteFunction(name, remotesFolder) :: Folder
+	end
+
+	return Helpers.createRemoteFunction(name, remotesFolder) :: Folder
+end
+
+function Helpers.waitForRemoteEventInstance(
+	remotesFolder: Instance,
+	name: string,
+	timeoutSeconds: number,
+	unreliable: boolean
+): Instance
+	local deadline = os.clock() + timeoutSeconds
+	local callerTraceback = debug.traceback(nil, 2)
+
+	while os.clock() < deadline do
+		local child = remotesFolder:FindFirstChild(name)
+		local endpoint = Helpers.getRemoteEventEndpoint(child, unreliable)
+		if endpoint then
+			return endpoint
+		end
+		task.wait()
+	end
+
+	local existing = remotesFolder:FindFirstChild(name)
+	local detail = if existing
+		then "found " .. existing.ClassName .. " but expected a RemoteEvent or shared folder with Event"
+		else "remote never replicated from the server"
+	error(
+		string.format(
+			"[Shortcuts] Timed out after %ds waiting for RemoteEvent '%s' (%s).\n  Called from:\n%s",
+			timeoutSeconds,
+			name,
+			detail,
+			callerTraceback
+		),
+		2
+	)
+end
+
+function Helpers.waitForRemoteFunctionFolder(
+	remotesFolder: Instance,
+	name: string,
+	timeoutSeconds: number,
+	unreliable: boolean
+): Folder
+	local deadline = os.clock() + timeoutSeconds
+	local callerTraceback = debug.traceback(nil, 2)
+
+	while os.clock() < deadline do
+		local child = remotesFolder:FindFirstChild(name)
+		if Helpers.isRemoteFunctionFolder(child, unreliable) then
+			return child :: Folder
+		end
+		task.wait()
+	end
+
+	local existing = remotesFolder:FindFirstChild(name)
+	local detail = if existing
+		then "found " .. existing.ClassName .. " but expected a Folder with Sent/Receive"
+		else "folder never replicated from the server"
+	error(
+		string.format(
+			"[Shortcuts] Timed out after %ds waiting for RemoteFunction '%s' (%s).\n  Called from:\n%s",
+			timeoutSeconds,
+			name,
+			detail,
+			callerTraceback
+		),
+		2
+	)
 end
 
 function Helpers.protectedCallback(name: string, cb: any, ...: any): (boolean, ...any)

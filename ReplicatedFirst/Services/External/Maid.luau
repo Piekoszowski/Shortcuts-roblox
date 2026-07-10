@@ -160,6 +160,10 @@ function Maid:Add(object: any)
 	return token
 end
 
+function Maid:Mark(object: any)
+	return self:Add(object)
+end
+
 function Maid:Cleanup(...)
 	if self.key ~= nil then
 		error(`[{script.Name}]: "Cleanup()" is locked for this Maid`)

@@ -67,14 +67,14 @@ function Module.Init(player: Player): ()
 		tempEvent:CallBack(function()
 			print("temp bindable event ran")
 		end)
-		tempEvent:Disconnect()
+		tempEvent:DisconnectAll()
 
 		-- all shortcut events support disconnect cleanup.
 		local tempFunction = S.BindableFunction("ShowTempBindableFunction")
 		tempFunction:CallBack(function(): string
 			return "temp ok"
 		end)
-		tempFunction:Disconnect()
+		tempFunction:DisconnectAll()
 		print("temp bindable objects are off")
 	end
 end

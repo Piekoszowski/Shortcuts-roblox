@@ -42,7 +42,7 @@ function Module.Init(_player: Player): ()
 		tempUnreliable:CallBack(function()
 			print("temp unreliable callback ran")
 		end)
-		tempUnreliable:Disconnect()
+		tempUnreliable:DisconnectAll()
 		print("temp unreliable listener is off")
 	end
 end

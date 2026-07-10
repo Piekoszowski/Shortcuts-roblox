@@ -14,17 +14,33 @@ local Signal = require(game:GetService("ReplicatedFirst"):FindFirstChild("Signal
 type CallbackList = { any }
 
 local function waitForChildStrict(parent: Instance, childName: string): Instance
-	local child = parent:WaitForChild(childName, math.huge)
+	local child = parent:WaitForChild(childName, Helpers.REMOTE_SETUP_TIMEOUT_SECONDS)
 	if child == nil then
-		error("cant find '" .. childName .. "' under " .. parent:GetFullName() .. "\n  Traceback:\n" .. debug.traceback(),2)
+		error(
+			"cant find '"
+				.. childName
+				.. "' under "
+				.. parent:GetFullName()
+				.. " after "
+				.. tostring(Helpers.REMOTE_SETUP_TIMEOUT_SECONDS)
+				.. "s\n  Traceback:\n"
+				.. debug.traceback(),
+			2
+		)
 	end
 	return child
 end
 
 local function getRemotesFolder(): Instance
-	local remotesFolder = ReplicatedStorage:WaitForChild("Remotes", math.huge)
+	local remotesFolder = ReplicatedStorage:WaitForChild("Remotes", Helpers.REMOTE_SETUP_TIMEOUT_SECONDS)
 	if remotesFolder == nil then
-		error("ReplicatedStorage.Remotes not found.\n  Traceback:\n" .. debug.traceback(), 2)
+		error(
+			"ReplicatedStorage.Remotes not found after "
+				.. tostring(Helpers.REMOTE_SETUP_TIMEOUT_SECONDS)
+				.. "s.\n  Traceback:\n"
+				.. debug.traceback(),
+			2
+		)
 	end
 	return remotesFolder
 end
@@ -56,6 +72,8 @@ export type Remote = {
 	GetCallBack: ((self: Remote, ...any) -> any)?,
 	Set: ((self: Remote, info: { [string]: any }) -> ())?,
 	Disconnect: ((self: Remote) -> ())?,
+	DisconnectAll: ((self: Remote) -> ())?,
+	Connect: ((self: Remote, cb: any) -> any)?,
 }
 
 export type ShortcutsScript = Instance & {
@@ -66,6 +84,7 @@ export type ShortcutsScript = Instance & {
 type Request = {
 	Remote: any,
 	Data: { n: number, [number]: any },
+	Traceback: string?,
 }
 
 type CallbackRegistration = {
@@ -98,11 +117,12 @@ type CallbackRegistration = {
 	event/function:FireAll(...) | Server-only sends a :Fire to all player instances in the server.
 	event/function:FireAllExcept({ playerA }, ...) | Server-only sends a :Fire to all player instances except the ones in the table you pass as the first argument. Players that are no longer in the server are silently ignored.
 	event/function:FireDistance(sourcePlayer, distance?, ...) | Server-only at the time of firing on the server it sends a :Fire to all player instances that have their sourcePlayer.Character within the given distance of the 1st argument player.Character. (distance defaults to 20).
-	event/function:CallBack(function(...) end) | Connects a listener. On reliable server events the first argument is the firing Player. :Disconnect to disconnect.
+	event/function:CallBack(function(...) end) | Connects a listener. Returns a scoped handle — call :Disconnect() on that handle to remove only this listener (safe for maids / useEffect cleanup).
+	event/function:Connect(function(...) end) | Alias for :CallBack().
 	event/function:Once(function(...) end) | Connects a listener that removes itself after the first fire.
 	event/function:GetCallBack() | Returns the callback list table for this remote/bindable/reliable/unreliable name.
 	event/function:Set({ RateLimit = 120, RateLimitTime = 1 }) | Updates RateLimit, RateLimitTime fields on the object after construction.
-	event/function:Disconnect() | Clears callbacks, signal connections, and every entry for this endpoint with the same name! It's name (string) bound not object bound unfortunately. (TODO: might want to)
+	event/function:DisconnectAll() | Clears every callback, signal connection, and registry entry for this endpoint name globally. Do not use for per-script cleanup.
 	unreliables work with the same api, however bindables run local listeners immediately (still rate limited as a good practice)
 
 	Multiple callbacks per name are allowed.
@@ -115,6 +135,82 @@ type CallbackRegistration = {
 --[[ RemoteBindableEvents ]]--
 return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 	local IsServer: boolean = RunService:IsServer()
+
+	local function resolveRemoteFunctionFolder(
+		name: string,
+		remotesFolder: Instance,
+		unreliable: boolean,
+		requestConnection: RemoteEvent
+	): Folder
+		if IsServer then
+			return Helpers.ensureRemoteFunctionFolder(name, remotesFolder, unreliable)
+		end
+
+		local existing = remotesFolder:FindFirstChild(name)
+		if Helpers.isRemoteFunctionFolder(existing, unreliable) then
+			return existing :: Folder
+		end
+
+		requestConnection:FireServer(false, name)
+		return Helpers.waitForRemoteFunctionFolder(
+			remotesFolder,
+			name,
+			Helpers.REMOTE_SETUP_TIMEOUT_SECONDS,
+			unreliable
+		)
+	end
+
+	local function resolveRemoteEventInstance(
+		name: string,
+		remotesFolder: Instance,
+		unreliable: boolean,
+		requestConnection: RemoteEvent
+	): Instance
+		if IsServer then
+			return Helpers.ensureRemoteEventInstance(name, remotesFolder, unreliable)
+		end
+
+		local existing = remotesFolder:FindFirstChild(name)
+		local endpoint = Helpers.getRemoteEventEndpoint(existing, unreliable)
+		if endpoint then
+			return endpoint
+		end
+
+		requestConnection:FireServer(true, name)
+		return Helpers.waitForRemoteEventInstance(
+			remotesFolder,
+			name,
+			Helpers.REMOTE_SETUP_TIMEOUT_SECONDS,
+			unreliable
+		)
+	end
+
+	local NetworkMonitorRef: any = nil
+	if IsServer then
+		task.defer(function()
+			local success, monitor = pcall(function()
+				local serverScripts = game:GetService("ServerScriptService")
+				local servicesFolder = serverScripts:FindFirstChild("Services")
+				local networkMonitor = if servicesFolder then servicesFolder:FindFirstChild("NetworkMonitor") else nil
+
+				if not (networkMonitor and networkMonitor:IsA("ModuleScript")) then
+					local startupFolder = serverScripts:FindFirstChild("Main") or serverScripts:FindFirstChild("Autorun")
+					if startupFolder then
+						networkMonitor = startupFolder:FindFirstChild("NetworkMonitor")
+					end
+				end
+
+				if not (networkMonitor and networkMonitor:IsA("ModuleScript")) then
+					return nil
+				end
+
+				return require(networkMonitor)
+			end)
+			if success and monitor then
+				NetworkMonitorRef = monitor
+			end
+		end)
+	end
 
 	--[[ Callback Stores ]]--
 	local RemoteFunctionCallbacks: { [string]: CallbackList } = {}
@@ -174,6 +270,18 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 
 	--[[ Main ]]--
 	local function ServerPostSimulationListener()
+		if NetworkMonitorRef then
+			if #RequestsList > 0 then
+				NetworkMonitorRef.LogShortcutsOutgoing(RequestsList, "FireClient")
+			end
+			if #FireAllRequestsList > 0 then
+				NetworkMonitorRef.LogShortcutsOutgoing(FireAllRequestsList, "FireAll")
+			end
+			if #FireAllFunctionRequestsList > 0 then
+				NetworkMonitorRef.LogShortcutsOutgoing(FireAllFunctionRequestsList, "FireAll")
+			end
+		end
+
 		for _, Request in ipairs(RequestsList) do
 			local Remote: any = Request.Remote
 			local Data = Request.Data
@@ -213,9 +321,9 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 			function(_player: Player, OneWay: boolean, Name: string)
 				local folder = getRemotesFolder()
 				if OneWay then
-					Helpers.createRemoteEvent(Name, folder)
+					Helpers.ensureRemoteEventInstance(Name, folder, false)
 				else
-					Helpers.createRemoteFunction(Name, folder)
+					Helpers.ensureRemoteFunctionFolder(Name, folder, false)
 				end
 			end
 		)
@@ -224,9 +332,9 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 			function(_player: Player, OneWay: boolean, Name: string)
 				local folder = getRemotesFolder()
 				if OneWay then
-					Helpers.createUnreliableRemoteEvent(Name, folder)
+					Helpers.ensureRemoteEventInstance(Name, folder, true)
 				else
-					Helpers.createUnreliableRemoteFunction(Name, folder)
+					Helpers.ensureRemoteFunctionFolder(Name, folder, true)
 				end
 			end
 		)
@@ -245,6 +353,7 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 		table.insert(RequestsList, {
 			Remote = Remote,
 			Data = table.pack(...),
+			Traceback = if IsServer and NetworkMonitorRef then debug.traceback() else nil,
 		})
 	end
 
@@ -252,6 +361,7 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 		table.insert(FireAllRequestsList, {
 			Remote = Remote,
 			Data = table.pack(...),
+			Traceback = if IsServer and NetworkMonitorRef then debug.traceback() else nil,
 		})
 	end
 
@@ -259,6 +369,7 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 		table.insert(FireAllFunctionRequestsList, {
 			Remote = Remote,
 			Data = table.pack(...),
+			Traceback = if IsServer and NetworkMonitorRef then debug.traceback() else nil,
 		})
 	end
 
@@ -401,6 +512,19 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 		end
 	end
 
+	local function createCallbackCleanupHandle(disconnect: () -> ()): { Disconnect: () -> () }
+		local connected = true
+		return {
+			Disconnect = function()
+				if not connected then
+					return
+				end
+				connected = false
+				disconnect()
+			end,
+		}
+	end
+
 	local function AddRemoteEventCallback(NameOrSelf: any, CallBack: any)
 		local Name: string
 		if type(NameOrSelf) == "table" then
@@ -416,6 +540,16 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 			Name,
 			CallBack
 		)
+
+		return createCallbackCleanupHandle(function()
+			removeEventCallback(
+				RemoteEventsany,
+				RemoteEventsSignals,
+				RemoteEventCallbackRegistrations,
+				Name,
+				CallBack
+			)
+		end)
 	end
 
 	local function AddUnreliableRemoteEventCallback(NameOrSelf: any, CallBack: any)
@@ -433,6 +567,16 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 			Name,
 			CallBack
 		)
+
+		return createCallbackCleanupHandle(function()
+			removeEventCallback(
+				UnreliableRemoteEventsany,
+				UnreliableRemoteEventsSignals,
+				UnreliableRemoteEventCallbackRegistrations,
+				Name,
+				CallBack
+			)
+		end)
 	end
 
 	local function BindableCallBackDisconnect(self: Remote)
@@ -481,22 +625,55 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 
 	function Module.RemoteFunction:CallBack(CallBack: any): any
 		local selfRemote: Remote = self
-		if IsServer then
-			RemoteFunctionCallbacks[selfRemote._Name] = RemoteFunctionCallbacks[selfRemote._Name] or {}
-			table.insert(RemoteFunctionCallbacks[selfRemote._Name], CallBack)
-			return RemoteFunctionCallbacks[selfRemote._Name]
-		else
-			ClientRemoteFunctionCallbacks[selfRemote._Name] = ClientRemoteFunctionCallbacks[selfRemote._Name] or {}
-			table.insert(ClientRemoteFunctionCallbacks[selfRemote._Name], CallBack)
-			return ClientRemoteFunctionCallbacks[selfRemote._Name]
-		end
+		local name = selfRemote._Name
+		local callbackStore = if IsServer then RemoteFunctionCallbacks else ClientRemoteFunctionCallbacks
+
+		callbackStore[name] = callbackStore[name] or {}
+		table.insert(callbackStore[name], CallBack)
+
+		return createCallbackCleanupHandle(function()
+			local callbacks = callbackStore[name]
+			if not callbacks then
+				return
+			end
+
+			for i = #callbacks, 1, -1 do
+				if callbacks[i] == CallBack then
+					table.remove(callbacks, i)
+					break
+				end
+			end
+
+			if #callbacks == 0 then
+				callbackStore[name] = nil
+			end
+		end)
 	end
 
 	function Module.UnreliableRemoteFunction:CallBack(CallBack: any): any
 		local selfRemote: Remote = self
-		UnreliableRemoteFunctionCallbacks[selfRemote._Name] = UnreliableRemoteFunctionCallbacks[selfRemote._Name] or {}
-		table.insert(UnreliableRemoteFunctionCallbacks[selfRemote._Name], CallBack)
-		return UnreliableRemoteFunctionCallbacks[selfRemote._Name]
+		local name = selfRemote._Name
+
+		UnreliableRemoteFunctionCallbacks[name] = UnreliableRemoteFunctionCallbacks[name] or {}
+		table.insert(UnreliableRemoteFunctionCallbacks[name], CallBack)
+
+		return createCallbackCleanupHandle(function()
+			local callbacks = UnreliableRemoteFunctionCallbacks[name]
+			if not callbacks then
+				return
+			end
+
+			for i = #callbacks, 1, -1 do
+				if callbacks[i] == CallBack then
+					table.remove(callbacks, i)
+					break
+				end
+			end
+
+			if #callbacks == 0 then
+				UnreliableRemoteFunctionCallbacks[name] = nil
+			end
+		end)
 	end
 
 	--[[ Disconnect Utilities ]]--
@@ -858,7 +1035,7 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 		setmetatable(self :: any, Module.BindableFunction)
 		self.TimeOut = info.TimeOut or 3
 		self.Receive = nil
-		self.Disconnect = BindableFunctionDisconnect
+		self.DisconnectAll = BindableFunctionDisconnect
 
 		BindableFunctionsRegistry[Name] = self
 		return self
@@ -876,23 +1053,11 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 		self.TimeOut = info.TimeOut or 3
 
 		local remotesFolder = getRemotesFolder()
-		local existing = remotesFolder:FindFirstChild(Name)
-		local Folder: Instance
-		if existing then
-			Folder = existing
-		else
-			if IsServer then
-				Helpers.createRemoteFunction(Name, remotesFolder)
-			else
-				queueFire(ShortcutsMain.RemoteConnection, false, Name)
-			end
-			Folder = waitForChildStrict(remotesFolder, Name)
-		end
-
-		local sentChild = waitForChildStrict(Folder, "Sent")
-		local receiveChild = waitForChildStrict(Folder, "Receive")
-		assert(sentChild:IsA("RemoteEvent"), "RemoteFunction Sent has to be a RemoteEvent")
-		assert(receiveChild:IsA("RemoteEvent"), "RemoteFunction Receive has to be a RemoteEvent")
+		local folder = resolveRemoteFunctionFolder(Name, remotesFolder, false, ShortcutsMain.RemoteConnection)
+		local sentChild = folder:FindFirstChild("Sent")
+		local receiveChild = folder:FindFirstChild("Receive")
+		assert(sentChild and sentChild:IsA("RemoteEvent"), "RemoteFunction Sent has to be a RemoteEvent")
+		assert(receiveChild and receiveChild:IsA("RemoteEvent"), "RemoteFunction Receive has to be a RemoteEvent")
 		local sent: RemoteEvent = sentChild
 		local receive: RemoteEvent = receiveChild
 		self._Sent = sent
@@ -923,7 +1088,7 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 			)
 		end
 
-		self.Disconnect = RemoteFunctionDisconnect
+		self.DisconnectAll = RemoteFunctionDisconnect
 
 		RemoteFunctionsRegistry[Name] = self
 		return self
@@ -941,23 +1106,17 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 		self.TimeOut = info.TimeOut or 3
 
 		local remotesFolder = getRemotesFolder()
-		local existing = remotesFolder:FindFirstChild(Name)
-		local Folder: Instance
-		if existing then
-			Folder = existing
-		else
-			if IsServer then
-				Helpers.createUnreliableRemoteFunction(Name, remotesFolder)
-			else
-				queueFire(ShortcutsMain.UnreliableRemoteConnection, false, Name)
-			end
-			Folder = waitForChildStrict(remotesFolder, Name)
-		end
-
-		local sentChild = waitForChildStrict(Folder, "Sent")
-		local receiveChild = waitForChildStrict(Folder, "Receive")
-		assert(sentChild:IsA("UnreliableRemoteEvent") or sentChild:IsA("RemoteEvent"), "Sent has to be a remote event")
-		assert(receiveChild:IsA("UnreliableRemoteEvent") or receiveChild:IsA("RemoteEvent"), "Receive has to be a remote event")
+		local folder = resolveRemoteFunctionFolder(Name, remotesFolder, true, ShortcutsMain.UnreliableRemoteConnection)
+		local sentChild = folder:FindFirstChild("Sent")
+		local receiveChild = folder:FindFirstChild("Receive")
+		assert(
+			sentChild and (sentChild:IsA("UnreliableRemoteEvent") or sentChild:IsA("RemoteEvent")),
+			"Sent has to be a remote event"
+		)
+		assert(
+			receiveChild and (receiveChild:IsA("UnreliableRemoteEvent") or receiveChild:IsA("RemoteEvent")),
+			"Receive has to be a remote event"
+		)
 		local sent: any = sentChild
 		local receive: any = receiveChild
 		self._Sent = sent
@@ -980,7 +1139,7 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 			)
 		end
 
-		self.Disconnect = UnreliableRemoteFunctionDisconnect
+		self.DisconnectAll = UnreliableRemoteFunctionDisconnect
 
 		UnreliableRemoteFunctionsRegistry[Name] = self
 		return self
@@ -1028,29 +1187,27 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 
 		local remotesFolder = getRemotesFolder()
 		local existingRemote = remotesFolder:FindFirstChild(Name)
+		local remoteInstance = Helpers.getRemoteEventEndpoint(existingRemote, true)
 
-		if existingRemote then
-			self._Remote = existingRemote
+		if remoteInstance then
+			self._Remote = remoteInstance
 			if not UnreliableRemoteEventsConnections[Name] then
-				UnreliableRemoteEventListener(Name, existingRemote :: UnreliableRemoteEvent)
+				UnreliableRemoteEventListener(Name, remoteInstance :: UnreliableRemoteEvent)
+			end
+		elseif IsServer then
+			local ensured = Helpers.ensureRemoteEventInstance(Name, remotesFolder, true)
+			self._Remote = ensured
+			if not UnreliableRemoteEventsConnections[Name] then
+				UnreliableRemoteEventListener(Name, ensured :: UnreliableRemoteEvent)
 			end
 		else
-			if IsServer then
-				local created = Helpers.createUnreliableRemoteEvent(Name, remotesFolder)
-				self._Remote = created
+			task.spawn(function()
+				local ensured = resolveRemoteEventInstance(Name, remotesFolder, true, ShortcutsMain.UnreliableRemoteConnection)
+				self._Remote = ensured
 				if not UnreliableRemoteEventsConnections[Name] then
-					UnreliableRemoteEventListener(Name, created :: UnreliableRemoteEvent)
+					UnreliableRemoteEventListener(Name, ensured :: UnreliableRemoteEvent)
 				end
-			else
-				task.spawn(function()
-					ShortcutsMain.UnreliableRemoteConnection:FireServer(true, Name)
-					local remote = waitForChildStrict(remotesFolder, Name)
-					self._Remote = remote
-					if not UnreliableRemoteEventsConnections[Name] then
-						UnreliableRemoteEventListener(Name, remote :: UnreliableRemoteEvent)
-					end
-				end)
-			end
+			end)
 		end
 
 		self.Fire = RemoteFire
@@ -1059,11 +1216,12 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 		self.FireAllExcept = RemoteFireAllExcept
 		self.FireDistance = RemoteFireDistance
 		self.CallBack = AddUnreliableRemoteEventCallback :: any
+		self.Connect = AddUnreliableRemoteEventCallback :: any
 		self.Once = UnreliableRemoteOnce
 		self._CallBackType = UnreliableRemoteEventsany
 		self.GetCallBack = getCallBack :: any
 		self.Set = setFields
-		self.Disconnect = UnreliableRemoteEventDisconnect
+		self.DisconnectAll = UnreliableRemoteEventDisconnect
 
 		UnreliableRemotesRegistry[Name] = self
 		return self
@@ -1080,29 +1238,27 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 
 		local remotesFolder = getRemotesFolder()
 		local existingRemote = remotesFolder:FindFirstChild(Name)
+		local remoteInstance = Helpers.getRemoteEventEndpoint(existingRemote, false)
 
-		if existingRemote then
-			self._Remote = existingRemote
+		if remoteInstance then
+			self._Remote = remoteInstance
 			if not RemoteEventsConnections[Name] then
-				RemoteEventListener(Name, existingRemote :: RemoteEvent)
+				RemoteEventListener(Name, remoteInstance :: RemoteEvent)
+			end
+		elseif IsServer then
+			local ensured = Helpers.ensureRemoteEventInstance(Name, remotesFolder, false)
+			self._Remote = ensured
+			if not RemoteEventsConnections[Name] then
+				RemoteEventListener(Name, ensured :: RemoteEvent)
 			end
 		else
-			if IsServer then
-				local created = Helpers.createRemoteEvent(Name, remotesFolder)
-				self._Remote = created
+			task.spawn(function()
+				local ensured = resolveRemoteEventInstance(Name, remotesFolder, false, ShortcutsMain.RemoteConnection)
+				self._Remote = ensured
 				if not RemoteEventsConnections[Name] then
-					RemoteEventListener(Name, created :: RemoteEvent)
+					RemoteEventListener(Name, ensured :: RemoteEvent)
 				end
-			else
-				task.spawn(function()
-					ShortcutsMain.RemoteConnection:FireServer(true, Name)
-					local remote = waitForChildStrict(remotesFolder, Name)
-					self._Remote = remote
-					if not RemoteEventsConnections[Name] then
-						RemoteEventListener(Name, remote :: RemoteEvent)
-					end
-				end)
-			end
+			end)
 		end
 
 		self.Fire = RemoteFire
@@ -1111,11 +1267,12 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 		self.FireAllExcept = RemoteFireAllExcept
 		self.FireDistance = RemoteFireDistance
 		self.CallBack = AddRemoteEventCallback :: any
+		self.Connect = AddRemoteEventCallback :: any
 		self.Once = RemoteOnce
 		self._CallBackType = RemoteEventsany
 		self.GetCallBack = getCallBack :: any
 		self.Set = setFields
-		self.Disconnect = RemoteEventDisconnect
+		self.DisconnectAll = RemoteEventDisconnect
 
 		RemotesRegistry[Name] = self
 		return self
@@ -1133,10 +1290,11 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 		self.Fire = BindableFire
 		self.Invoke = BindableInvoke
 		self.CallBack = BindableCallBack :: any
+		self.Connect = BindableCallBack :: any
 		self._CallBackType = BindableEventsany
 		self.GetCallBack = getCallBack :: any
 		self.Set = setFields
-		self.Disconnect = BindableEventDisconnect
+		self.DisconnectAll = BindableEventDisconnect
 
 		BindableEventsRegistry[Name] = self
 		return self
@@ -1215,10 +1373,28 @@ return function(Module: { [string]: any }, ShortcutsMain: ShortcutsScript)
 
 	function Module.BindableFunction:CallBack(CallBack: any): any
 		local selfRemote: Remote = self
-		BindableFunctionsany[selfRemote._Name] = BindableFunctionsany[selfRemote._Name]
-			or {}
-		table.insert(BindableFunctionsany[selfRemote._Name], CallBack)
-		return BindableFunctionsany[selfRemote._Name]
+		local name = selfRemote._Name
+
+		BindableFunctionsany[name] = BindableFunctionsany[name] or {}
+		table.insert(BindableFunctionsany[name], CallBack)
+
+		return createCallbackCleanupHandle(function()
+			local callbacks = BindableFunctionsany[name]
+			if not callbacks then
+				return
+			end
+
+			for i = #callbacks, 1, -1 do
+				if callbacks[i] == CallBack then
+					table.remove(callbacks, i)
+					break
+				end
+			end
+
+			if #callbacks == 0 then
+				BindableFunctionsany[name] = nil
+			end
+		end)
 	end
 
 	function Module.BindableFunction:GetCallBack(): any?
